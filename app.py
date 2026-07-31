@@ -4,6 +4,9 @@ from PIL import Image
 import numpy as np
 from ultralytics import YOLO
 import os
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+import av
+import threading
 
 # =========================================================
 # KONFIGURASI HALAMAN
@@ -471,7 +474,7 @@ with tab_beranda:
     <div class="hero-section">
         <div class="hero-eyebrow">Teknologi Deteksi Berbasis YOLOv8</div>
         <h1>Identifikasi Jenis Sapi<br>Secara Otomatis</h1>
-        <p>Unggah foto atau gunakan kamera untuk mendeteksi dan mengklasifikasikan
+        <p>Unggah foto atau gunakan kamera real-time untuk mendeteksi dan mengklasifikasikan
         jenis sapi secara instan — cepat, akurat, dan mudah digunakan.</p>
     </div>
 
@@ -492,8 +495,8 @@ with tab_beranda:
         </div>
         <div class="step-card">
             <div class="step-num">02</div>
-            <div class="step-title">Upload atau Foto Langsung</div>
-            <div class="step-desc">Pilih sumber foto — unggah dari perangkat atau ambil via kamera.</div>
+            <div class="step-title">Upload atau Kamera Real-Time</div>
+            <div class="step-desc">Pilih sumber deteksi — unggah foto dari perangkat atau gunakan kamera secara real-time.</div>
         </div>
         <div class="step-card">
             <div class="step-num">03</div>
@@ -511,7 +514,7 @@ with tab_deteksi:
     with col_set1:
         metode = st.selectbox(
             "Metode Input",
-            ("📁  Upload Foto", "📷  Kamera (Snapshot)"),
+            ("📁  Upload Foto", "📷  Kamera Real-Time"),
             label_visibility="visible",
         )
     with col_set2:
@@ -545,12 +548,105 @@ with tab_deteksi:
             </div>
             """, unsafe_allow_html=True)
 
-    else:  # Kamera
-        kamera_file = st.camera_input("Arahkan kamera ke sapi, lalu ambil foto")
-        if kamera_file:
-            img = Image.open(kamera_file).convert("RGB")
-            with st.spinner("Mendeteksi..."):
-                prediksi(img, conf_threshold)
+    else:  # Kamera Real-Time
+        st.markdown(
+            '<div class="section-label">Kamera Real-Time</div>',
+            unsafe_allow_html=True
+        )
+        st.caption(
+            "Arahkan kamera ke sapi. Sistem akan mendeteksi jenis sapi "
+            "secara langsung tanpa perlu mengambil foto."
+        )
+
+        # Lock agar model tidak dipanggil bersamaan oleh beberapa frame.
+        if "camera_lock" not in st.session_state:
+            st.session_state.camera_lock = threading.Lock()
+
+        RTC_CONFIGURATION = RTCConfiguration({
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        })
+
+        def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+            img = frame.to_ndarray(format="bgr24")
+
+            # Hindari inferensi bertumpuk jika frame datang terlalu cepat.
+            if st.session_state.camera_lock.acquire(blocking=False):
+                try:
+                    results = model.predict(
+                        source=img,
+                        conf=conf_threshold,
+                        verbose=False
+                    )
+
+                    result = results[0]
+                    boxes = result.boxes
+                    jumlah_objek = len(boxes)
+
+                    if jumlah_objek > 0:
+                        # Ada sapi: tampilkan bounding box, kelas, dan confidence.
+                        annotated = result.plot()
+
+                        # Tambahkan status jumlah objek agar terlihat langsung
+                        # pada video real-time.
+                        cv2.rectangle(
+                            annotated, (10, 10), (330, 55),
+                            (45, 106, 79), -1
+                        )
+                        cv2.putText(
+                            annotated,
+                            f"Sapi terdeteksi: {jumlah_objek}",
+                            (22, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.75,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA
+                        )
+                    else:
+                        # Tidak ada sapi: tetap tampilkan kamera dan pesan
+                        # seperti perilaku deteksi foto sebelumnya.
+                        annotated = img.copy()
+                        cv2.rectangle(
+                            annotated, (10, 10), (380, 58),
+                            (80, 80, 80), -1
+                        )
+                        cv2.putText(
+                            annotated,
+                            "Tidak ada sapi terdeteksi",
+                            (22, 42),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.72,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA
+                        )
+
+                    return av.VideoFrame.from_ndarray(
+                        annotated, format="bgr24"
+                    )
+                finally:
+                    st.session_state.camera_lock.release()
+
+            return frame
+
+        webrtc_streamer(
+            key="sapi-realtime-camera",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            video_frame_callback=video_frame_callback,
+            media_stream_constraints={
+                "video": True,
+                "audio": False
+            },
+            async_processing=True,
+        )
+
+        st.info(
+            "💡 Klik **START** untuk menyalakan kamera. "
+            "Jika tidak ada sapi, video akan menampilkan "
+            "\"Tidak ada sapi terdeteksi\". Jika sapi terdeteksi, "
+            "bounding box dan confidence akan muncul langsung."
+        )
 
 # =========================================================
 # TAB 3: INFORMASI JENIS SAPI
