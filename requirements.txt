@@ -4,3 +4,4 @@ ultralytics-opencv-headless
 numpy
 Pillow
 av>=16.0.0
+streamlit-autorefresh
