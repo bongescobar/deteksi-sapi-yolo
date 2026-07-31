@@ -674,13 +674,20 @@ with tab_deteksi:
 
             return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
-        webrtc_streamer(
+        webrtc_ctx = webrtc_streamer(
             key="sapi-realtime-camera",
             mode=WebRtcMode.SENDRECV,
             rtc_configuration=RTC_CONFIGURATION,
             video_frame_callback=video_frame_callback,
             media_stream_constraints={
-                "video": True,
+                # Batasi resolusi & frame rate capture di sisi browser.
+                # Ini mengurangi beban encode/decode WebRTC secara signifikan
+                # (penyebab utama video patah-patah), terpisah dari beban YOLO.
+                "video": {
+                    "width": {"ideal": 640, "max": 960},
+                    "height": {"ideal": 480, "max": 720},
+                    "frameRate": {"ideal": 15, "max": 20},
+                },
                 "audio": False
             },
             async_processing=True,
@@ -692,6 +699,56 @@ with tab_deteksi:
             "\"Tidak ada sapi terdeteksi\". Jika sapi terdeteksi, "
             "bounding box dan confidence akan muncul langsung."
         )
+
+        # =====================================================
+        # KARTU INFO BREED HASIL DETEKSI (mirror mode Upload Foto)
+        # =====================================================
+        st.markdown('<div class="section-label" style="margin-top:20px;">Informasi Breed Terdeteksi</div>', unsafe_allow_html=True)
+        info_placeholder = st.empty()
+
+        def render_detection_info():
+            with camera_state["lock"]:
+                dets_now = list(camera_state["detections"])
+            with info_placeholder.container():
+                if not dets_now:
+                    st.caption("Belum ada sapi yang terdeteksi kamera.")
+                    return
+                # Ambil confidence tertinggi per kelas yang sedang terdeteksi.
+                kelas_terdeteksi = {}
+                for d in dets_now:
+                    if d["cls"] not in kelas_terdeteksi or d["conf"] > kelas_terdeteksi[d["cls"]]:
+                        kelas_terdeteksi[d["cls"]] = d["conf"]
+                for cls_name, conf in kelas_terdeteksi.items():
+                    info = INFO_SAPI.get(cls_name, {})
+                    badge_cls = "badge-high" if conf >= 0.7 else "badge-mid" if conf >= 0.5 else "badge-low"
+                    st.markdown(f"""
+                    <div class="breed-result-card">
+                        <div class="breed-result-name">
+                            {info.get('emoji','🐄')} {cls_name}
+                            <span class="{badge_cls}">{conf:.0%}</span>
+                        </div>
+                        <div class="info-row"><div class="info-label">Tipe</div><div class="info-value">{info.get('tipe','—')}</div></div>
+                        <div class="info-row"><div class="info-label">Asal</div><div class="info-value">{info.get('asal','—')}</div></div>
+                        <div class="info-row"><div class="info-label">Ciri Fisik</div><div class="info-value">{info.get('ciri_fisik','—')}</div></div>
+                        <div class="info-row"><div class="info-label">Keunggulan</div><div class="info-value">{info.get('keunggulan','—')}</div></div>
+                        <div class="info-row"><div class="info-label">Pemanfaatan</div><div class="info-value">{info.get('pemanfaatan','—')}</div></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+        render_detection_info()
+
+        if webrtc_ctx.state.playing:
+            try:
+                from streamlit_autorefresh import st_autorefresh
+                st_autorefresh(interval=1200, key="camera_info_autorefresh")
+            except ImportError:
+                st.caption(
+                    "ℹ️ Untuk kartu info di atas ter-update otomatis tanpa "
+                    "perlu klik apa pun, install paket tambahan: "
+                    "`pip install streamlit-autorefresh` (lalu tambahkan ke "
+                    "requirements.txt). Untuk sekarang, kartu akan update "
+                    "saat ada interaksi (mis. geser slider confidence)."
+                )
 
 # =========================================================
 # TAB 3: INFORMASI JENIS SAPI
