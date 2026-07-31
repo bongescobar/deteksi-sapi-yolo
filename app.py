@@ -741,15 +741,6 @@ with tab_deteksi:
             try:
                 from streamlit_autorefresh import st_autorefresh
                 st_autorefresh(interval=1200, key="camera_info_autorefresh")
-            except ImportError:
-                st.caption(
-                    "ℹ️ Untuk kartu info di atas ter-update otomatis tanpa "
-                    "perlu klik apa pun, install paket tambahan: "
-                    "`pip install streamlit-autorefresh` (lalu tambahkan ke "
-                    "requirements.txt). Untuk sekarang, kartu akan update "
-                    "saat ada interaksi (mis. geser slider confidence)."
-                )
-
 # =========================================================
 # TAB 3: INFORMASI JENIS SAPI
 # =========================================================
