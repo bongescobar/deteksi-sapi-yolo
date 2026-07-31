@@ -521,7 +521,7 @@ with tab_deteksi:
         conf_threshold = st.slider(
             "Confidence Threshold",
             min_value=0.10, max_value=1.00,
-            value=0.50, step=0.05,
+            value=0.25, step=0.05,
         )
 
     st.markdown("<hr style='margin:12px 0 20px;border:none;border-top:1px solid #EDE8DF;'>", unsafe_allow_html=True)
@@ -573,7 +573,8 @@ with tab_deteksi:
             if st.session_state.camera_lock.acquire(blocking=False):
                 try:
                     results = model.predict(
-                        source=img,
+                        source=cv2.resize(img,(512,512)),
+                        imgsz=512,
                         conf=conf_threshold,
                         verbose=False
                     )
@@ -627,7 +628,7 @@ with tab_deteksi:
                 finally:
                     st.session_state.camera_lock.release()
 
-            return frame
+            return av.VideoFrame.from_ndarray(img, format="bgr24")
 
         webrtc_streamer(
             key="sapi-realtime-camera",
