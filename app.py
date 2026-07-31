@@ -521,7 +521,7 @@ with tab_deteksi:
         conf_threshold = st.slider(
             "Confidence Threshold",
             min_value=0.10, max_value=1.00,
-            value=0.25, step=0.05,
+            value=0.50, step=0.05,
         )
 
     st.markdown("<hr style='margin:12px 0 20px;border:none;border-top:1px solid #EDE8DF;'>", unsafe_allow_html=True)
@@ -558,77 +558,91 @@ with tab_deteksi:
             "secara langsung tanpa perlu mengambil foto."
         )
 
-        # Lock agar model tidak dipanggil bersamaan oleh beberapa frame.
-        if "camera_lock" not in st.session_state:
-            st.session_state.camera_lock = threading.Lock()
+        # PENTING: video_frame_callback dijalankan oleh streamlit-webrtc di
+        # THREAD TERPISAH (bukan thread utama Streamlit). st.session_state
+        # TIDAK BOLEH diakses dari thread lain -> akan raise exception yang
+        # ditelan diam-diam oleh streamlit-webrtc, sehingga frame asli yang
+        # dikembalikan (video normal tapi tanpa bounding box sama sekali).
+        # Solusinya: simpan lock & state sebagai resource global (cache_resource),
+        # BUKAN di st.session_state.
+        @st.cache_resource
+        def get_camera_state():
+            return {
+                "lock": threading.Lock(),
+                "frame_count": 0,
+                "last_annotated": None,
+            }
+
+        camera_state = get_camera_state()
+
+        # Proses YOLO hanya setiap N frame agar tidak lag; frame di antaranya
+        # memakai hasil anotasi terakhir (frame skipping).
+        PROCESS_EVERY_N_FRAMES = 3
+        INFER_WIDTH = 480  # kecilkan resolusi sebelum inferensi -> jauh lebih cepat
 
         RTC_CONFIGURATION = RTCConfiguration({
             "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
         })
 
+        def _annotate(img, conf_threshold):
+            h, w = img.shape[:2]
+            scale = INFER_WIDTH / w if w > INFER_WIDTH else 1.0
+            small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale != 1.0 else img
+
+            results = model.predict(
+                source=small,
+                conf=conf_threshold,
+                imgsz=INFER_WIDTH,
+                verbose=False,
+            )
+            result = results[0]
+            boxes = result.boxes
+            jumlah_objek = len(boxes)
+
+            annotated_small = result.plot()
+            # Kembalikan ke resolusi asli agar tampilan tetap tajam.
+            annotated = cv2.resize(annotated_small, (w, h)) if scale != 1.0 else annotated_small
+
+            if jumlah_objek > 0:
+                cv2.rectangle(annotated, (10, 10), (330, 55), (45, 106, 79), -1)
+                cv2.putText(
+                    annotated, f"Sapi terdeteksi: {jumlah_objek}", (22, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA
+                )
+            else:
+                cv2.rectangle(annotated, (10, 10), (380, 58), (80, 80, 80), -1)
+                cv2.putText(
+                    annotated, "Tidak ada sapi terdeteksi", (22, 42),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA
+                )
+            return annotated
+
         def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
             img = frame.to_ndarray(format="bgr24")
 
-            # Hindari inferensi bertumpuk jika frame datang terlalu cepat.
-            if st.session_state.camera_lock.acquire(blocking=False):
+            camera_state["frame_count"] += 1
+            do_infer = (camera_state["frame_count"] % PROCESS_EVERY_N_FRAMES == 0)
+
+            if do_infer and camera_state["lock"].acquire(blocking=False):
                 try:
-                    results = model.predict(
-                        source=cv2.resize(img,(512,512)),
-                        imgsz=512,
-                        conf=conf_threshold,
-                        verbose=False
+                    annotated = _annotate(img, conf_threshold)
+                    camera_state["last_annotated"] = annotated
+                    return av.VideoFrame.from_ndarray(annotated, format="bgr24")
+                except Exception as e:
+                    # Jangan biarkan error tertelan diam-diam; tampilkan pesan
+                    # di frame supaya langsung terlihat ada masalah.
+                    err_img = img.copy()
+                    cv2.putText(
+                        err_img, f"Error: {e}", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA
                     )
-
-                    result = results[0]
-                    boxes = result.boxes
-                    jumlah_objek = len(boxes)
-
-                    if jumlah_objek > 0:
-                        # Ada sapi: tampilkan bounding box, kelas, dan confidence.
-                        annotated = result.plot()
-
-                        # Tambahkan status jumlah objek agar terlihat langsung
-                        # pada video real-time.
-                        cv2.rectangle(
-                            annotated, (10, 10), (330, 55),
-                            (45, 106, 79), -1
-                        )
-                        cv2.putText(
-                            annotated,
-                            f"Sapi terdeteksi: {jumlah_objek}",
-                            (22, 40),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.75,
-                            (255, 255, 255),
-                            2,
-                            cv2.LINE_AA
-                        )
-                    else:
-                        # Tidak ada sapi: tetap tampilkan kamera dan pesan
-                        # seperti perilaku deteksi foto sebelumnya.
-                        annotated = img.copy()
-                        cv2.rectangle(
-                            annotated, (10, 10), (380, 58),
-                            (80, 80, 80), -1
-                        )
-                        cv2.putText(
-                            annotated,
-                            "Tidak ada sapi terdeteksi",
-                            (22, 42),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.72,
-                            (255, 255, 255),
-                            2,
-                            cv2.LINE_AA
-                        )
-
-                    return av.VideoFrame.from_ndarray(
-                        annotated, format="bgr24"
-                    )
+                    return av.VideoFrame.from_ndarray(err_img, format="bgr24")
                 finally:
-                    st.session_state.camera_lock.release()
+                    camera_state["lock"].release()
 
-            return av.VideoFrame.from_ndarray(img, format="bgr24")
+            # Frame yang di-skip: tampilkan frame asli (bukan hasil deteksi lama)
+            # supaya video tetap mulus/real-time, bukan freeze.
+            return frame
 
         webrtc_streamer(
             key="sapi-realtime-camera",
