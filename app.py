@@ -4,8 +4,10 @@ from PIL import Image
 import numpy as np
 from ultralytics import YOLO
 import os
-from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration, VideoProcessorBase
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 import av
+import threading
+
 # =========================================================
 # KONFIGURASI HALAMAN
 # =========================================================
@@ -546,91 +548,106 @@ with tab_deteksi:
             </div>
             """, unsafe_allow_html=True)
 
-else:
-    st.markdown(
-        '<div class="section-label">Kamera Real-Time</div>',
-        unsafe_allow_html=True
-    )
+    else:  # Kamera Real-Time
+        st.markdown(
+            '<div class="section-label">Kamera Real-Time</div>',
+            unsafe_allow_html=True
+        )
+        st.caption(
+            "Arahkan kamera ke sapi. Sistem akan mendeteksi jenis sapi "
+            "secara langsung tanpa perlu mengambil foto."
+        )
 
-    st.caption(
-        "Arahkan kamera ke sapi. Deteksi dilakukan secara otomatis."
-    )
+        # Lock agar model tidak dipanggil bersamaan oleh beberapa frame.
+        if "camera_lock" not in st.session_state:
+            st.session_state.camera_lock = threading.Lock()
 
-    RTC_CONFIGURATION = RTCConfiguration(
-        {
-            "iceServers": [
-                {"urls": ["stun:stun.l.google.com:19302"]}
-            ]
-        }
-    )
+        RTC_CONFIGURATION = RTCConfiguration({
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        })
 
-    class YOLOProcessor(VideoProcessorBase):
-
-        def recv(self, frame):
-
+        def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
             img = frame.to_ndarray(format="bgr24")
 
-            results = model.predict(
-                img,
-                imgsz=640,
-                conf=conf_threshold,
-                verbose=False
-            )
+            # Hindari inferensi bertumpuk jika frame datang terlalu cepat.
+            if st.session_state.camera_lock.acquire(blocking=False):
+                try:
+                    results = model.predict(
+                        source=img,
+                        conf=conf_threshold,
+                        verbose=False
+                    )
 
-            result = results[0]
+                    result = results[0]
+                    boxes = result.boxes
+                    jumlah_objek = len(boxes)
 
-            if len(result.boxes) > 0:
+                    if jumlah_objek > 0:
+                        # Ada sapi: tampilkan bounding box, kelas, dan confidence.
+                        annotated = result.plot()
 
-                annotated = result.plot()
+                        # Tambahkan status jumlah objek agar terlihat langsung
+                        # pada video real-time.
+                        cv2.rectangle(
+                            annotated, (10, 10), (330, 55),
+                            (45, 106, 79), -1
+                        )
+                        cv2.putText(
+                            annotated,
+                            f"Sapi terdeteksi: {jumlah_objek}",
+                            (22, 40),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.75,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA
+                        )
+                    else:
+                        # Tidak ada sapi: tetap tampilkan kamera dan pesan
+                        # seperti perilaku deteksi foto sebelumnya.
+                        annotated = img.copy()
+                        cv2.rectangle(
+                            annotated, (10, 10), (380, 58),
+                            (80, 80, 80), -1
+                        )
+                        cv2.putText(
+                            annotated,
+                            "Tidak ada sapi terdeteksi",
+                            (22, 42),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.72,
+                            (255, 255, 255),
+                            2,
+                            cv2.LINE_AA
+                        )
 
-            else:
+                    return av.VideoFrame.from_ndarray(
+                        annotated, format="bgr24"
+                    )
+                finally:
+                    st.session_state.camera_lock.release()
 
-                annotated = img.copy()
+            return frame
 
-                cv2.rectangle(
-                    annotated,
-                    (10, 10),
-                    (360, 55),
-                    (70, 70, 70),
-                    -1,
-                )
+        webrtc_streamer(
+            key="sapi-realtime-camera",
+            mode=WebRtcMode.SENDRECV,
+            rtc_configuration=RTC_CONFIGURATION,
+            video_frame_callback=video_frame_callback,
+            media_stream_constraints={
+                "video": True,
+                "audio": False
+            },
+            async_processing=True,
+        )
 
-                cv2.putText(
-                    annotated,
-                    "Tidak ada sapi terdeteksi",
-                    (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.7,
-                    (255,255,255),
-                    2,
-                )
+        st.info(
+            "💡 Klik **START** untuk menyalakan kamera. "
+            "Jika tidak ada sapi, video akan menampilkan "
+            "\"Tidak ada sapi terdeteksi\". Jika sapi terdeteksi, "
+            "bounding box dan confidence akan muncul langsung."
+        )
 
-            return av.VideoFrame.from_ndarray(
-                annotated,
-                format="bgr24"
-            )
-
-    webrtc_streamer(
-
-        key="kamera",
-
-        mode=WebRtcMode.SENDRECV,
-
-        rtc_configuration=RTC_CONFIGURATION,
-
-        media_stream_constraints={
-            "video": True,
-            "audio": False,
-        },
-
-        video_processor_factory=YOLOProcessor,
-
-        async_processing=True,
-    )
-
-    st.info(
-        "Klik START untuk menyalakan kamera."
-    )
 # =========================================================
 # TAB 3: INFORMASI JENIS SAPI
 # =========================================================
