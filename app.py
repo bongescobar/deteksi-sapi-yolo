@@ -574,14 +574,12 @@ with tab_deteksi:
                 try:
                     results = model.predict(
                         source=img,
+                        imgsz=640,
                         conf=conf_threshold,
                         verbose=False
                     )
-                    print("YOLO berhasil dijalankan")
-                    print(results)
                     result = results[0]
                     boxes = result.boxes
-                    print("Jumlah box:", len(boxes))
                     jumlah_objek = len(boxes)
 
                     if jumlah_objek > 0:
