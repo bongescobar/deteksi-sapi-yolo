@@ -7,6 +7,7 @@ import os
 from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
 import av
 import threading
+import time
 
 # =========================================================
 # KONFIGURASI HALAMAN
@@ -561,52 +562,107 @@ with tab_deteksi:
         # PENTING: video_frame_callback dijalankan oleh streamlit-webrtc di
         # THREAD TERPISAH (bukan thread utama Streamlit). st.session_state
         # TIDAK BOLEH diakses dari thread lain -> akan raise exception yang
-        # ditelan diam-diam oleh streamlit-webrtc, sehingga frame asli yang
-        # dikembalikan (video normal tapi tanpa bounding box sama sekali).
-        # Solusinya: simpan lock & state sebagai resource global (cache_resource),
-        # BUKAN di st.session_state.
+        # ditelan diam-diam, sehingga frame asli dikembalikan tanpa box.
+        # Solusinya: simpan state di resource global (cache_resource).
+        #
+        # ARSITEKTUR: callback video TIDAK BOLEH menunggu YOLO selesai,
+        # kalau tidak video jadi patah-patah (blocking). Jadi YOLO dijalankan
+        # di THREAD BACKGROUND TERPISAH yang terus memproses frame terbaru
+        # secepat model mampu, sementara callback video hanya menggambar
+        # hasil deteksi TERAKHIR yang tersedia ke SETIAP frame (tidak
+        # pernah skip) -> video tetap mulus & box tidak berkedip.
         @st.cache_resource
         def get_camera_state():
-            return {
+            state = {
                 "lock": threading.Lock(),
-                "frame_count": 0,
-                "last_annotated": None,
+                "latest_frame": None,      # frame mentah terbaru dari kamera
+                "detections": [],           # hasil deteksi terakhir (list of dict)
+                "conf": 0.5,                 # threshold terkini (diupdate dari slider)
+                "worker_started": False,
+                "error": None,
             }
 
-        camera_state = get_camera_state()
+            def _worker():
+                while True:
+                    frame = None
+                    with state["lock"]:
+                        if state["latest_frame"] is not None:
+                            frame = state["latest_frame"]
+                            state["latest_frame"] = None  # tandai sudah diambil
+                            conf = state["conf"]
+                    if frame is not None:
+                        try:
+                            results = model.predict(
+                                source=frame,
+                                conf=conf,
+                                imgsz=480,   # inferensi di resolusi lebih kecil -> cepat,
+                                             # tapi koordinat box otomatis dikembalikan
+                                             # ke skala frame ASLI oleh Ultralytics
+                                verbose=False,
+                            )
+                            result = results[0]
+                            dets = []
+                            for box in result.boxes:
+                                x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int).tolist()
+                                cls_name = model.names[int(box.cls[0])]
+                                conf_val = float(box.conf[0])
+                                dets.append({
+                                    "xyxy": (x1, y1, x2, y2),
+                                    "cls": cls_name,
+                                    "conf": conf_val,
+                                })
+                            with state["lock"]:
+                                state["detections"] = dets
+                                state["error"] = None
+                        except Exception as e:
+                            with state["lock"]:
+                                state["error"] = str(e)
+                    else:
+                        time.sleep(0.01)  # tidak ada frame baru, hindari busy-loop
 
-        # Proses YOLO hanya setiap N frame agar tidak lag; frame di antaranya
-        # memakai hasil anotasi terakhir (frame skipping).
-        PROCESS_EVERY_N_FRAMES = 3
-        INFER_WIDTH = 480  # kecilkan resolusi sebelum inferensi -> jauh lebih cepat
+            t = threading.Thread(target=_worker, daemon=True)
+            t.start()
+            state["worker_started"] = True
+            return state
+
+        camera_state = get_camera_state()
+        camera_state["conf"] = conf_threshold  # update threshold tiap rerun (main thread, aman)
 
         RTC_CONFIGURATION = RTCConfiguration({
             "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
         })
 
-        def _annotate(img, conf_threshold):
-            h, w = img.shape[:2]
-            scale = INFER_WIDTH / w if w > INFER_WIDTH else 1.0
-            small = cv2.resize(img, (int(w * scale), int(h * scale))) if scale != 1.0 else img
+        def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
+            img = frame.to_ndarray(format="bgr24")
 
-            results = model.predict(
-                source=small,
-                conf=conf_threshold,
-                imgsz=INFER_WIDTH,
-                verbose=False,
-            )
-            result = results[0]
-            boxes = result.boxes
-            jumlah_objek = len(boxes)
+            # Kirim frame terbaru ke worker (non-blocking, tidak menunggu hasil).
+            with camera_state["lock"]:
+                camera_state["latest_frame"] = img.copy()
+                dets = list(camera_state["detections"])
+                err = camera_state["error"]
 
-            annotated_small = result.plot()
-            # Kembalikan ke resolusi asli agar tampilan tetap tajam.
-            annotated = cv2.resize(annotated_small, (w, h)) if scale != 1.0 else annotated_small
+            annotated = img  # gambar langsung di atas frame asli (resolusi penuh, tajam)
 
-            if jumlah_objek > 0:
+            if err:
+                cv2.putText(
+                    annotated, f"Error: {err}", (10, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA
+                )
+            elif dets:
+                for d in dets:
+                    x1, y1, x2, y2 = d["xyxy"]
+                    label = f"{d['cls']} {d['conf']:.0%}"
+                    cv2.rectangle(annotated, (x1, y1), (x2, y2), (45, 106, 79), 2)
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    ty = max(y1, th + 8)
+                    cv2.rectangle(annotated, (x1, ty - th - 8), (x1 + tw + 8, ty), (45, 106, 79), -1)
+                    cv2.putText(
+                        annotated, label, (x1 + 4, ty - 5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA
+                    )
                 cv2.rectangle(annotated, (10, 10), (330, 55), (45, 106, 79), -1)
                 cv2.putText(
-                    annotated, f"Sapi terdeteksi: {jumlah_objek}", (22, 40),
+                    annotated, f"Sapi terdeteksi: {len(dets)}", (22, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA
                 )
             else:
@@ -615,34 +671,8 @@ with tab_deteksi:
                     annotated, "Tidak ada sapi terdeteksi", (22, 42),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.72, (255, 255, 255), 2, cv2.LINE_AA
                 )
-            return annotated
 
-        def video_frame_callback(frame: av.VideoFrame) -> av.VideoFrame:
-            img = frame.to_ndarray(format="bgr24")
-
-            camera_state["frame_count"] += 1
-            do_infer = (camera_state["frame_count"] % PROCESS_EVERY_N_FRAMES == 0)
-
-            if do_infer and camera_state["lock"].acquire(blocking=False):
-                try:
-                    annotated = _annotate(img, conf_threshold)
-                    camera_state["last_annotated"] = annotated
-                    return av.VideoFrame.from_ndarray(annotated, format="bgr24")
-                except Exception as e:
-                    # Jangan biarkan error tertelan diam-diam; tampilkan pesan
-                    # di frame supaya langsung terlihat ada masalah.
-                    err_img = img.copy()
-                    cv2.putText(
-                        err_img, f"Error: {e}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2, cv2.LINE_AA
-                    )
-                    return av.VideoFrame.from_ndarray(err_img, format="bgr24")
-                finally:
-                    camera_state["lock"].release()
-
-            # Frame yang di-skip: tampilkan frame asli (bukan hasil deteksi lama)
-            # supaya video tetap mulus/real-time, bukan freeze.
-            return frame
+            return av.VideoFrame.from_ndarray(annotated, format="bgr24")
 
         webrtc_streamer(
             key="sapi-realtime-camera",
