@@ -741,6 +741,10 @@ with tab_deteksi:
             try:
                 from streamlit_autorefresh import st_autorefresh
                 st_autorefresh(interval=1200, key="camera_info_autorefresh")
+                except Exception:
+                pass
+
+                
 # =========================================================
 # TAB 3: INFORMASI JENIS SAPI
 # =========================================================
