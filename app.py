@@ -738,13 +738,9 @@ with tab_deteksi:
         render_detection_info()
 
         if webrtc_ctx.state.playing:
-            try:
                 from streamlit_autorefresh import st_autorefresh
                 st_autorefresh(interval=1200, key="camera_info_autorefresh")
-                except Exception:
-                pass
-
-                
+            
 # =========================================================
 # TAB 3: INFORMASI JENIS SAPI
 # =========================================================
